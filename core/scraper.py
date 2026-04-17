@@ -132,11 +132,23 @@ class CongoBetScraper:
             rows.append(row)
         return rows
 
-    def scrape_match_markets(self, page, min_seconds: int = 20) -> Dict:
+    def scrape_match_markets(self, page, min_seconds: int = 20, target_round_index: Optional[int] = None) -> Dict:
+        """
+        Récupère les marchés 1X2 et G/NG pour une affiche.
+        Si target_round_index est fourni (index dans la liste des rounds),
+        cette affiche est forcée ; sinon, la sélection automatique est utilisée.
+        """
         self._go_tab(page, 'MATCHS')
         rounds = self._round_items(page)
-        target = self._choose_target_round(rounds, min_seconds=min_seconds)
-        label = self._click_round(page, target['index'])
+        if target_round_index is not None and 0 <= target_round_index < len(rounds):
+            # Utilisation de l'index choisi manuellement par l'utilisateur
+            label = self._click_round(page, target_round_index)
+            target = {'index': target_round_index, 'label': label, 'reason': 'user-selected'}
+        else:
+            target = self._choose_target_round(rounds, min_seconds=min_seconds)
+            label = self._click_round(page, target['index'])
+            target['selected_label'] = label
+
         self._ensure_market(page, '1X2')
         one_x_two = self._parse_match_cards(page, '1X2')
         self._ensure_market(page, 'G/NG')
@@ -150,7 +162,7 @@ class CongoBetScraper:
         return {
             'snapshot_ts': utc_now_iso(),
             'rounds': rounds,
-            'target_round': {**target, 'selected_label': label},
+            'target_round': target,
             'matches': list(merged.values()),
         }
 
@@ -235,9 +247,28 @@ class CongoBetScraper:
         parsed = self._parse_results_text(body)
         return {'snapshot_ts': utc_now_iso(), 'results': parsed, 'raw_text': body[:10000]}
 
-    def scrape_all(self, min_seconds: int = 20, include_results: bool = True, include_standings: bool = True) -> Dict:
+    def scrape_all(self, min_seconds: int = 20, include_results: bool = True, include_standings: bool = True,
+                   target_round_index: Optional[int] = None) -> Dict:
+        """
+        Lance le scraping complet.
+        Si target_round_index est fourni, cette affiche (round) sera forcée.
+        """
         with sync_playwright() as p:
             browser = self._launch_browser(p)
+            context = browser.new_context(viewport={'width': 1440, 'height': 2200}, locale='fr-FR')
+            page = context.new_page()
+            self._open_page(page)
+            market_snapshot = self.scrape_match_markets(page, min_seconds=min_seconds, target_round_index=target_round_index)
+            standings_snapshot = self.scrape_standings(page) if include_standings else None
+            results_snapshot = self.scrape_results(page) if include_results else None
+            browser.close()
+            return {
+                'source_url': URL,
+                'scraped_at_utc': utc_now_iso(),
+                'market_snapshot': market_snapshot,
+                'standings_snapshot': standings_snapshot,
+                'results_snapshot': results_snapshot,
+                             }      browser = self._launch_browser(p)
             context = browser.new_context(viewport={'width': 1440, 'height': 2200}, locale='fr-FR')
             page = context.new_page()
             self._open_page(page)
