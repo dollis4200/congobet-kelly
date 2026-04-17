@@ -1,3 +1,184 @@
+after_affiches': rescrape_after_affiches,
+}
+db['settings'] = cfg
+save_db(db)
+ensure_initial_bankroll_record(db, initial_bankroll)
+
+if auto_refresh:
+    st_autorefresh(interval=int(refresh_secs * 1000), key='congobet_refresh')
+
+cbtn1, cbtn2 = st.columns([1, 2])
+manual_cycle = cbtn1.button('▶️ Lancer un cycle maintenant', use_container_width=True)
+if cbtn2.button('💾 Sauvegarder la base locale', use_container_width=True):
+    save_db(db)
+    st.success(f'Base sauvegardée dans {DEFAULT_DB_PATH.name}')
+
+snapshot = latest_snapshot(db)
+opp_df = pd.DataFrame(db.get('last_opportunities', [])) if db.get('last_opportunities') else compute_opportunities(db, snapshot, latest_bankroll(db, initial_bankroll), kelly_scale, min_stake, max_stake_pct)
+bankroll_current = latest_bankroll(db, initial_bankroll)
+
+if manual_cycle or auto_refresh:
+    target_idx = st.session_state.get('selected_round_index') if st.session_state.get('available_rounds') else None
+    with st.spinner('Scraping CongoBet en cours...'):
+        try:
+            snapshot, opp_df, bankroll_current = run_scrape_cycle(db, initial_bankroll, bankroll_current, cfg, target_round_index=target_idx)
+            st.session_state['db'] = db
+            st.success('Cycle terminé.')
+        except Exception as e:
+            st.error(f'Cycle échoué: {e}')
+            append_log(db, f'Erreur de cycle: {e}', level='ERROR')
+            save_db(db)
+
+render_metrics(snapshot, opp_df, bankroll_current, initial_bankroll)
+
+if bankroll_current < 0.40 * initial_bankroll:
+    st.warning('⚠️ La bankroll est passée sous 40% du capital initial. Active l’option de continuité si tu veux poursuivre les nouveaux paris simulés.')
+
+with st.expander('ℹ️ Détails de la cible de scraping'):
+    st.write({'source_url': URL, 'target_round': (snapshot.get('market_snapshot') or {}).get('target_round', {}), 'db_path': str(DEFAULT_DB_PATH), 'seed_path': str(SEED_DB_PATH)})
+
+live_tab, opp_tab, bets_tab, bankroll_tab, data_tab, logs_tab = st.tabs(['📺 Vue live', '🎯 Opportunités Kelly', '🧾 Paris simulés', '📈 Bankroll', '🗂️ Données', '🪵 Logs'])
+
+with live_tab:
+    market_df = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
+    standings_rows = (snapshot.get('standings_snapshot') or {}).get('standings', [])
+    standings_df = pd.DataFrame(standings_rows)
+    st.subheader('Rencontres actuelles ciblées')
+    if not market_df.empty:
+        st.dataframe(market_df, use_container_width=True, hide_index=True)
+    else:
+        st.info('Aucune rencontre disponible dans le dernier snapshot.')
+    st.subheader('Classement actuel')
+    if not standings_df.empty:
+        st.dataframe(standings_df, use_container_width=True, hide_index=True)
+    else:
+        st.info('Classement non encore scrapé.')
+
+with opp_tab:
+    st.subheader('Opportunités en temps réel')
+    if not opp_df.empty:
+        display_df = opp_df.copy()
+        cols = ['round_time', 'home_team', 'away_team', 'recommended_market', 'selection', 'odds', 'estimated_probability', 'edge', 'stake', 'p_1', 'p_X', 'p_2', 'p_oui', 'p_non']
+        cols = [c for c in cols if c in display_df.columns]
+        st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger les opportunités (CSV)', data=to_csv_bytes(display_df), file_name='opportunites_kelly.csv', mime='text/csv')
+    else:
+        st.info('Aucune opportunité détectée pour les paramètres actuels.')
+
+with bets_tab:
+    st.subheader('Suivi des paris simulés')
+    bets_df = paper_bets_df(db)
+    if not bets_df.empty:
+        open_df = bets_df[bets_df['status'] == 'open']
+        settled_df = bets_df[bets_df['status'].isin(['won', 'lost'])]
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Paris ouverts', len(open_df))
+        c2.metric('Paris gagnés', int((bets_df['status'] == 'won').sum()))
+        c3.metric('Paris perdus', int((bets_df['status'] == 'lost').sum()))
+        st.dataframe(bets_df, use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger les paris simulés (CSV)', data=to_csv_bytes(bets_df), file_name='paper_bets.csv', mime='text/csv')
+    else:
+        st.info('Aucun pari simulé enregistré.')
+
+with bankroll_tab:
+    st.subheader('Suivi bankroll')
+    render_bankroll_graph(db)
+    curve_df = bankroll_curve_df(db)
+    if not curve_df.empty:
+        st.dataframe(curve_df.tail(50), use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger la courbe bankroll (CSV)', data=to_csv_bytes(curve_df), file_name='bankroll_history.csv', mime='text/csv')
+
+with data_tab:
+    st.subheader('Exports')
+    results_latest = pd.DataFrame((snapshot.get('results_snapshot') or {}).get('results', []))
+    standings_latest = pd.DataFrame((snapshot.get('standings_snapshot') or {}).get('standings', []))
+    market_latest = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
+    st.download_button('⬇️ Télécharger la base complète (JSON)', data=to_json_bytes(db), file_name='congobet_streamlit_db.json', mime='application/json')
+    if not results_latest.empty:
+        st.download_button('⬇️ Télécharger résultats récents (CSV)', data=to_csv_bytes(results_latest), file_name='results_recent.csv', mime='text/csv')
+    if not standings_latest.empty:
+        st.download_button('⬇️ Télécharger classement (CSV)', data=to_csv_bytes(standings_latest), file_name='standings.csv', mime='text/csv')
+    if not market_latest.empty:
+        st.download_button('⬇️ Télécharger marchés actuels (CSV)', data=to_csv_bytes(market_latest), file_name='markets_current.csv', mime='text/csv')
+
+with logs_tab:
+    logs_df = pd.DataFrame(db.get('logs', []))
+    if not logs_df.empty:
+        st.dataframe(logs_df.sort_values('ts', ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info('Aucun log pour le moment.')Détails de la cible de scraping'):
+    st.write({'source_url': URL, 'target_round': (snapshot.get('market_snapshot') or {}).get('target_round', {}), 'db_path': str(DEFAULT_DB_PATH), 'seed_path': str(SEED_DB_PATH)})
+
+live_tab, opp_tab, bets_tab, bankroll_tab, data_tab, logs_tab = st.tabs(['📺 Vue live', '🎯 Opportunités Kelly', '🧾 Paris simulés', '📈 Bankroll', '🗂️ Données', '🪵 Logs'])
+
+with live_tab:
+    market_df = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
+    standings_rows = (snapshot.get('standings_snapshot') or {}).get('standings', [])
+    standings_df = pd.DataFrame(standings_rows)
+    st.subheader('Rencontres actuelles ciblées')
+    if not market_df.empty:
+        st.dataframe(market_df, use_container_width=True, hide_index=True)
+    else:
+        st.info('Aucune rencontre disponible dans le dernier snapshot.')
+    st.subheader('Classement actuel')
+    if not standings_df.empty:
+        st.dataframe(standings_df, use_container_width=True, hide_index=True)
+    else:
+        st.info('Classement non encore scrapé.')
+
+with opp_tab:
+    st.subheader('Opportunités en temps réel')
+    if not opp_df.empty:
+        display_df = opp_df.copy()
+        cols = ['round_time', 'home_team', 'away_team', 'recommended_market', 'selection', 'odds', 'estimated_probability', 'edge', 'stake', 'p_1', 'p_X', 'p_2', 'p_oui', 'p_non']
+        cols = [c for c in cols if c in display_df.columns]
+        st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger les opportunités (CSV)', data=to_csv_bytes(display_df), file_name='opportunites_kelly.csv', mime='text/csv')
+    else:
+        st.info('Aucune opportunité détectée pour les paramètres actuels.')
+
+with bets_tab:
+    st.subheader('Suivi des paris simulés')
+    bets_df = paper_bets_df(db)
+    if not bets_df.empty:
+        open_df = bets_df[bets_df['status'] == 'open']
+        settled_df = bets_df[bets_df['status'].isin(['won', 'lost'])]
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Paris ouverts', len(open_df))
+        c2.metric('Paris gagnés', int((bets_df['status'] == 'won').sum()))
+        c3.metric('Paris perdus', int((bets_df['status'] == 'lost').sum()))
+        st.dataframe(bets_df, use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger les paris simulés (CSV)', data=to_csv_bytes(bets_df), file_name='paper_bets.csv', mime='text/csv')
+    else:
+        st.info('Aucun pari simulé enregistré.')
+
+with bankroll_tab:
+    st.subheader('Suivi bankroll')
+    render_bankroll_graph(db)
+    curve_df = bankroll_curve_df(db)
+    if not curve_df.empty:
+        st.dataframe(curve_df.tail(50), use_container_width=True, hide_index=True)
+        st.download_button('⬇️ Télécharger la courbe bankroll (CSV)', data=to_csv_bytes(curve_df), file_name='bankroll_history.csv', mime='text/csv')
+
+with data_tab:
+    st.subheader('Exports')
+    results_latest = pd.DataFrame((snapshot.get('results_snapshot') or {}).get('results', []))
+    standings_latest = pd.DataFrame((snapshot.get('standings_snapshot') or {}).get('standings', []))
+    market_latest = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
+    st.download_button('⬇️ Télécharger la base complète (JSON)', data=to_json_bytes(db), file_name='congobet_streamlit_db.json', mime='application/json')
+    if not results_latest.empty:
+        st.download_button('⬇️ Télécharger résultats récents (CSV)', data=to_csv_bytes(results_latest), file_name='results_recent.csv', mime='text/csv')
+    if not standings_latest.empty:
+        st.download_button('⬇️ Télécharger classement (CSV)', data=to_csv_bytes(standings_latest), file_name='standings.csv', mime='text/csv')
+    if not market_latest.empty:
+        st.download_button('⬇️ Télécharger marchés actuels (CSV)', data=to_csv_bytes(market_latest), file_name='markets_current.csv', mime='text/csv')
+
+with logs_tab:
+    logs_df = pd.DataFrame(db.get('logs', []))
+    if not logs_df.empty:
+        st.dataframe(logs_df.sort_values('ts', ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info('Aucun log pour le moment.')
 from __future__ import annotations
 
 import json
@@ -265,78 +446,6 @@ if bankroll_current < 0.40 * initial_bankroll:
     st.warning('⚠️ La bankroll est passée sous 40% du capital initial. Active l’option de continuité si tu veux poursuivre les nouveaux paris simulés.')
 
 with st.expander('ℹ️ Détails de la cible de scraping'):
-    st.write({'source_url': URL, 'target_round': (snapshot.get('market_snapshot') or {}).get('target_round', {}), 'db_path': str(DEFAULT_DB_PATH), 'seed_path': str(SEED_DB_PATH)})
-
-live_tab, opp_tab, bets_tab, bankroll_tab, data_tab, logs_tab = st.tabs(['📺 Vue live', '🎯 Opportunités Kelly', '🧾 Paris simulés', '📈 Bankroll', '🗂️ Données', '🪵 Logs'])
-
-with live_tab:
-    market_df = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
-    standings_rows = (snapshot.get('standings_snapshot') or {}).get('standings', [])
-    standings_df = pd.DataFrame(standings_rows)
-    st.subheader('Rencontres actuelles ciblées')
-    if not market_df.empty:
-        st.dataframe(market_df, use_container_width=True, hide_index=True)
-    else:
-        st.info('Aucune rencontre disponible dans le dernier snapshot.')
-    st.subheader('Classement actuel')
-    if not standings_df.empty:
-        st.dataframe(standings_df, use_container_width=True, hide_index=True)
-    else:
-        st.info('Classement non encore scrapé.')
-
-with opp_tab:
-    st.subheader('Opportunités en temps réel')
-    if not opp_df.empty:
-        display_df = opp_df.copy()
-        cols = ['round_time', 'home_team', 'away_team', 'recommended_market', 'selection', 'odds', 'estimated_probability', 'edge', 'stake', 'p_1', 'p_X', 'p_2', 'p_oui', 'p_non']
-        cols = [c for c in cols if c in display_df.columns]
-        st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
-        st.download_button('⬇️ Télécharger les opportunités (CSV)', data=to_csv_bytes(display_df), file_name='opportunites_kelly.csv', mime='text/csv')
-    else:
-        st.info('Aucune opportunité détectée pour les paramètres actuels.')
-
-with bets_tab:
-    st.subheader('Suivi des paris simulés')
-    bets_df = paper_bets_df(db)
-    if not bets_df.empty:
-        open_df = bets_df[bets_df['status'] == 'open']
-        settled_df = bets_df[bets_df['status'].isin(['won', 'lost'])]
-        c1, c2, c3 = st.columns(3)
-        c1.metric('Paris ouverts', len(open_df))
-        c2.metric('Paris gagnés', int((bets_df['status'] == 'won').sum()))
-        c3.metric('Paris perdus', int((bets_df['status'] == 'lost').sum()))
-        st.dataframe(bets_df, use_container_width=True, hide_index=True)
-        st.download_button('⬇️ Télécharger les paris simulés (CSV)', data=to_csv_bytes(bets_df), file_name='paper_bets.csv', mime='text/csv')
-    else:
-        st.info('Aucun pari simulé enregistré.')
-
-with bankroll_tab:
-    st.subheader('Suivi bankroll')
-    render_bankroll_graph(db)
-    curve_df = bankroll_curve_df(db)
-    if not curve_df.empty:
-        st.dataframe(curve_df.tail(50), use_container_width=True, hide_index=True)
-        st.download_button('⬇️ Télécharger la courbe bankroll (CSV)', data=to_csv_bytes(curve_df), file_name='bankroll_history.csv', mime='text/csv')
-
-with data_tab:
-    st.subheader('Exports')
-    results_latest = pd.DataFrame((snapshot.get('results_snapshot') or {}).get('results', []))
-    standings_latest = pd.DataFrame((snapshot.get('standings_snapshot') or {}).get('standings', []))
-    market_latest = market_df_from_snapshot(snapshot.get('market_snapshot') or {})
-    st.download_button('⬇️ Télécharger la base complète (JSON)', data=to_json_bytes(db), file_name='congobet_streamlit_db.json', mime='application/json')
-    if not results_latest.empty:
-        st.download_button('⬇️ Télécharger résultats récents (CSV)', data=to_csv_bytes(results_latest), file_name='results_recent.csv', mime='text/csv')
-    if not standings_latest.empty:
-        st.download_button('⬇️ Télécharger classement (CSV)', data=to_csv_bytes(standings_latest), file_name='standings.csv', mime='text/csv')
-    if not market_latest.empty:
-        st.download_button('⬇️ Télécharger marchés actuels (CSV)', data=to_csv_bytes(market_latest), file_name='markets_current.csv', mime='text/csv')
-
-with logs_tab:
-    logs_df = pd.DataFrame(db.get('logs', []))
-    if not logs_df.empty:
-        st.dataframe(logs_df.sort_values('ts', ascending=False), use_container_width=True, hide_index=True)
-    else:
-        st.info('Aucun log pour le moment.')Détails de la cible de scraping'):
     st.write({'source_url': URL, 'target_round': (snapshot.get('market_snapshot') or {}).get('target_round', {}), 'db_path': str(DEFAULT_DB_PATH), 'seed_path': str(SEED_DB_PATH)})
 
 live_tab, opp_tab, bets_tab, bankroll_tab, data_tab, logs_tab = st.tabs(['📺 Vue live', '🎯 Opportunités Kelly', '🧾 Paris simulés', '📈 Bankroll', '🗂️ Données', '🪵 Logs'])
